@@ -24,6 +24,8 @@
 
 ## 快速开始
 
+镜像已经公开，**不需要登录 GitHub、不需要 `docker login`**，直接拉就能用。同时提供 `amd64`（x86 NAS / 迷你主机 / 群晖大部分机型）和 `arm64`（ARM NAS、树莓派、M 系列 Mac）两个架构，Docker 会自动挑对应的。
+
 ### 方式一：docker compose（推荐）
 
 新建一个目录，放一个 `docker-compose.yml`：
@@ -196,6 +198,10 @@ docker run -d --name jiaofu115 --restart unless-stopped \
 **Q：推送一直失败**
 
 看「推送记录」里的具体原因。常见的是磁力失效（站点那边的种子挂了）或 115 空间不足。
+
+**Q：`docker pull` 卡住或特别慢**
+
+`ghcr.io` 国内直连有时不稳。给 Docker 配一下镜像加速或代理即可。实在拉不动就 `git clone` 下来本地 `docker build`（见「自己构建镜像」一节），效果完全一样。
 
 **Q：怎么完全卸载**
 
