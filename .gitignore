@@ -1,0 +1,12 @@
+# 运行时数据（数据库里有站点账号、115 Cookie，绝对不能提交/分享）
+data/
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统杂物
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+# 运行时数据（数据库里有账号密码和 115 Cookie）
+data/
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 版本控制 / 开发用
+.git/
+.github/
+.gitignore
+*.md
+
+# 系统杂物
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+services:
+  jiaofu115:
+    image: ghcr.io/loading543/jiaofu115:latest
+    container_name: jiaofu115
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PORT=8123
+      - DATA_DIR=/data
+    ports:
+      - "${APP_PORT:-8123}:8123"
+    volumes:
+      # 数据库、配置、日志都在这一个目录里，备份它就够了
+      - ./data:/data

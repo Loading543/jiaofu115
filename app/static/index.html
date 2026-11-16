@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a0d13">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>教父 → 115 · 自动离线</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%23f43f5e'/%3E%3Ctext x='32' y='43' font-size='28' font-weight='bold' fill='%23fff' text-anchor='middle' font-family='Arial'%3E115%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo">115</div>
+    <div>
+      <div class="brand-title">教父剧场</div>
+      <div class="brand-sub">自动离线到网盘</div>
+    </div>
+  </div>
+
+  <nav class="nav">
+    <a href="#latest" data-nav="latest"><span>🎬</span><b>最新更新</b></a>
+    <a href="#search" data-nav="search"><span>🔍</span><b>搜索</b></a>
+    <a href="#wash" data-nav="wash"><span>🔄</span><b>洗版升级</b></a>
+    <a href="#tasks" data-nav="tasks"><span>📥</span><b>推送记录</b></a>
+    <a href="#pan115" data-nav="pan115"><span>☁️</span><b>115 账号</b></a>
+    <a href="#site" data-nav="site"><span>🔐</span><b>站点登录</b></a>
+    <a href="#settings" data-nav="settings"><span>⚙️</span><b>设置</b></a>
+  </nav>
+
+  <div class="side-status">
+    <div class="pill" id="pill-site">站点 · 检查中</div>
+    <div class="pill" id="pill-pan">115 · 检查中</div>
+    <div class="pill" id="pill-auto">自动推送 · 检查中</div>
+    <div class="side-hint" id="side-sync">—</div>
+  </div>
+</aside>
+
+<main class="main">
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1 id="page-title">最新更新</h1>
+      <span class="muted" id="page-sub"></span>
+    </div>
+    <div class="topbar-right">
+      <div class="stat"><b id="st-items">0</b><span>条目</span></div>
+      <div class="stat"><b id="st-fresh">0</b><span>新上架</span></div>
+      <button class="btn ghost" id="btn-pause">暂停推送</button>
+      <button class="btn ghost" id="btn-sync">立即同步</button>
+    </div>
+  </header>
+
+  <section class="view" id="view-latest">
+    <div class="filterbar">
+      <div class="chips" id="cat-chips"></div>
+      <div class="toggles" id="cat-switches"></div>
+    </div>
+    <div class="listmeta">
+      <span id="latest-count" class="muted">—</span>
+      <span class="sp"></span>
+      <select id="sort-select" class="mini-select" title="排序方式">
+        <option value="new">最新上架</option>
+        <option value="old">最早上架</option>
+        <option value="size">体积从大到小</option>
+        <option value="douban">豆瓣评分从高到低</option>
+        <option value="title">标题 A → Z</option>
+      </select>
+      <button class="btn ghost small" id="btn-full-crawl">抓取全站</button>
+      <button class="btn ghost small hidden" id="btn-more">加载更多</button>
+    </div>
+    <div class="grid" id="grid-latest">
+      <div class="empty">正在加载…</div>
+    </div>
+  </section>
+
+  <section class="view hidden" id="view-search">
+    <div class="searchbar">
+      <input id="q" type="search" placeholder="搜索电影 / 电视剧 / 动漫，回车开始搜索">
+      <button class="btn" id="btn-search">搜索</button>
+    </div>
+    <div class="hint">搜索结果点「秒传 115」，会按你的规则挑磁力（默认体积最大）推送到已选目录。</div>
+    <div class="grid" id="grid-search"></div>
+  </section>
+
+  <section class="view hidden" id="view-wash">
+    <div class="card">
+      <h2>洗版升级</h2>
+      <p class="muted">扫描已经推送过的条目，如果站点上出现了分辨率更高 / 片源更好的版本，把 115 上的旧文件删掉换新的。
+        旧文件会进 115 回收站（可还原），不是彻底删除。</p>
+      <div class="washbar">
+        <div class="field"><label>每批检查条数</label>
+          <select id="wash-limit">
+            <option value="20">20 条（快）</option>
+            <option value="40" selected>40 条</option>
+            <option value="80">80 条（慢，注意站点限流）</option>
+            <option value="200">200 条（很慢）</option>
+          </select>
+        </div>
+        <div class="field"><label>判定为“更好”的门槛</label>
+          <select id="wash-gain">
+            <option value="1" selected>默认</option>
+            <option value="10000">严格</option>
+            <option value="0">宽松</option>
+          </select>
+        </div>
+        <button class="btn" id="btn-wash-scan">扫描可洗版</button>
+      </div>
+      <div class="washhint muted">
+        <div><b>默认</b>：分辨率/片源升一档，或同档体积大 15%（码率更高）。</div>
+        <div><b>严格</b>：只有分辨率或片源升档才换，不接受“体积变大但画质同级”。</div>
+        <div><b>宽松</b>：同档体积略大也换。缩小体积的重编码一律不换 —— 那是降质，不是洗版。</div>
+      </div>
+      <div class="washstat" id="wash-stat">还没扫描。点上面按钮开始。</div>
+    </div>
+
+    <div id="wash-list" class="wash-list"></div>
+
+    <div class="card">
+      <h2>洗版记录</h2>
+      <div class="table" id="wash-log"><div class="empty">暂无记录</div></div>
+    </div>
+  </section>
+
+  <section class="view hidden" id="view-tasks">
+    <div class="table" id="task-table"><div class="empty">加载中…</div></div>
+  </section>
+
+  <section class="view hidden" id="view-pan115">
+    <div class="card">
+      <h2>115 扫码登录</h2>
+      <p class="muted">选择一种扫码方式，用对应 App 扫描二维码即可授权登录。</p>
+      <div class="channels" id="channels"></div>
+      <div class="qr-wrap">
+        <div id="qrbox" class="qrbox"><div class="qr-empty">选择一种扫码方式</div></div>
+        <div class="qr-side">
+          <div class="qr-status" id="qr-status">等待选择</div>
+          <div class="muted" id="qr-desc"></div>
+          <button class="btn ghost small" id="btn-qr-refresh">刷新二维码</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="kv" id="pan-info">未登录</div>
+        <button class="btn danger ghost small" id="btn-pan-logout">退出登录</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>推送保存目录</h2>
+      <p class="muted">离线下载的文件会放到这个目录。不选则用 115 默认的「云下载」。</p>
+      <div class="pathrow">
+        <div class="pathbox" id="pan-path-show">未选择（默认云下载）</div>
+        <button class="btn small" id="btn-pick-dir">选择目录</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="view hidden" id="view-site">
+    <div class="card narrow">
+      <h2>站点账号登录</h2>
+      <p class="muted">用于抓取列表与磁力。凭据仅保存在本机数据库。</p>
+      <div class="field"><label>账号 / 邮箱</label><input id="site-user" autocomplete="username" placeholder="用户名或邮箱"></div>
+      <div class="field"><label>密码</label><input id="site-pass" type="password" autocomplete="current-password" placeholder="密码"></div>
+      <div class="row">
+        <button class="btn" id="btn-site-login">登录站点</button>
+        <button class="btn ghost small" id="btn-site-logout">退出</button>
+      </div>
+      <div class="msg" id="site-msg"></div>
+    </div>
+  </section>
+
+  <section class="view hidden" id="view-settings">
+    <div class="card">
+      <h2>自动推送</h2>
+      <div class="switch-row">
+        <label class="switch"><input type="checkbox" id="auto-enabled"><span></span></label>
+        <div><b>开启自动推送</b><div class="muted">关闭后仍会抓列表，但不会往 115 推送</div></div>
+        <div class="sp"></div>
+        <button class="btn ghost small" id="btn-pause2">暂停推送</button>
+      </div>
+      <div class="baseline" id="baseline-info">—</div>
+      <div class="form-grid">
+        <div class="field"><label>轮询间隔（分钟）</label><input id="auto-interval" type="number" min="5"></div>
+        <div class="field"><label>磁力选择</label>
+          <select id="auto-pick">
+            <option value="largest">优先最大体积</option>
+            <option value="smallest">优先最小体积</option>
+            <option value="latest">列表中第一个</option>
+          </select>
+        </div>
+        <div class="field"><label>最小体积（GB，0=不限）</label><input id="auto-min" type="number" min="0" step="0.1"></div>
+        <div class="field"><label>最大体积（GB，0=不限）</label><input id="auto-max" type="number" min="0" step="0.1"></div>
+        <div class="field"><label>单轮最多推送</label><input id="auto-maxpush" type="number" min="1"></div>
+        <div class="field"><label>增量同步每栏目页数</label><input id="auto-pages" type="number" min="1"></div>
+      </div>
+      <button class="btn" id="btn-save-settings">保存设置</button>
+    </div>
+
+    <div class="card">
+      <h2>推送保存目录</h2>
+      <p class="muted">选一个 115 网盘里的目录，磁力离线完成后会直接落到这里。</p>
+      <div class="pathrow">
+        <div class="pathbox" id="pan-path-show2">未选择（默认云下载）</div>
+        <button class="btn small" id="btn-pick-dir2">选择目录</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>栏目开关</h2>
+      <p class="muted">开启的栏目会被抓取；只有「新上架」的条目会自动推送（历史条目永远不自动推）。</p>
+      <div id="cat-manage" class="cat-manage"></div>
+      <button class="btn ghost small" id="btn-discover">从站点自动识别栏目</button>
+    </div>
+
+    <div class="card">
+      <h2>运行日志</h2>
+      <div class="logs" id="logs"></div>
+    </div>
+  </section>
+</main>
+
+<div class="modal hidden" id="modal">
+  <div class="modal-card">
+    <button class="modal-close" id="modal-close">×</button>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div class="toast hidden" id="toast"></div>
+
+<script src="/static/qrcode.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
