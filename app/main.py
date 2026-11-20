@@ -9,7 +9,7 @@ import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import jobs, pan, site, store
+from . import __version__, jobs, pan, site, store, subs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -77,8 +77,69 @@ def _watch_qr(tok):
         time.sleep(1)
 
 
+# ---- 手动转存任务（两个按钮）跟踪：后台跑，前端轮询 ----
+_conv_tasks = {}
+
+
+def _conv_latest():
+    """当前最值得看的转存任务（running/queued 优先，否则 10 分钟内完成的）。
+
+    挂在 /api/status 里返回，前端顶部横幅用它显示进度 —— 任何页面都能看到。
+    """
+    with _lock:
+        if not _conv_tasks:
+            return None
+        running = {k: v for k, v in _conv_tasks.items()
+                   if v.get("state") in ("running", "queued")}
+        tid = max(running or _conv_tasks)
+        t = dict(_conv_tasks[tid])
+    t["id"] = tid
+    fresh = t.get("state") in ("running", "queued") or (
+        t.get("done_at") and time.time() - t["done_at"] < 600)
+    return t if fresh else None
+_conv_seq = [0]
+
+
+def _conv_run(tid, item_id, mode, magnet, want_eps):
+    with _lock:
+        _conv_tasks[tid]["state"] = "running"
+
+    def _prog(done, total, _t0=[time.time()]):
+        if not total:
+            return
+        now = time.time()
+        speed = 0.0
+        if now > _t0[0]:
+            speed = 0.0  # 由 share_pull 侧计算更准，这里只报百分比
+        with _lock:
+            _conv_tasks[tid]["msg"] = f"下载中 {done * 100 // total}%（{done // 1048576}/{total // 1048576} MB）"
+
+    try:
+        r = subs.manual_convert(item_id, mode, magnet=magnet, want_eps=want_eps,
+                                on_progress=_prog)
+    except Exception as e:
+        r = {"ok": False, "msg": f"{type(e).__name__}: {str(e)[:160]}"}
+    with _lock:
+        t = _conv_tasks[tid]
+        t["state"] = "done"
+        t["ok"] = bool(r.get("ok"))
+        t["msg"] = r.get("msg") or ("完成" if r.get("ok") else "失败")
+        t["result"] = {k: v for k, v in r.items() if k in
+                       ("ok", "mode", "action", "n", "eps", "size", "size_text", "msg")}
+        t["done_at"] = time.time()
+    # 写进系统日志：任务内存态 5 分钟就清了，日志里永久可查
+    store.log(f"手动转存[{tid}] {mode} {item_id}: {t['msg']}",
+              "ok" if t["ok"] else "err")
+    # 五分钟后清理，避免无限增长
+    def _gc():
+        time.sleep(300)
+        with _lock:
+            _conv_tasks.pop(tid, None)
+    threading.Thread(target=_gc, daemon=True).start()
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "JiaofuBot/1.0"
+    server_version = "JiaofuBot/1.1"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -156,6 +217,7 @@ class Handler(BaseHTTPRequestHandler):
             safe.setdefault("site", {})["password"] = "***" if cfg["site"].get("password") else ""
             return self._send(200, {
                 "ok": True,
+                "version": __version__,
                 "site": {"base": cfg["site"]["base"], "username": cfg["site"].get("username", ""),
                          "logged": chk["ok"], "msg": chk["msg"]},
                 "pan": {"logged": P.logged_in(), "channels": pan.CHANNELS},
@@ -164,6 +226,8 @@ class Handler(BaseHTTPRequestHandler):
                 "by_cat": store.count_by_cat(),
                 "baseline_at": store.get_kv("baseline_at", 0),
                 "sync": jobs.state(),
+                "subs": {"state": subs.state(), "stats": store.sub_stats()},
+                "conv": _conv_latest(),
             })
 
         if path == "/api/site/captcha":
@@ -217,6 +281,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/wash/log":
             return self._send(200, {"ok": True, "washes": store.list_washes(int(g("limit", 60)))})
+
+        if path == "/api/subs":
+            return self._send(200, {
+                "ok": True,
+                "subs": store.subs_list(),
+                "state": subs.state(),
+                "cfg": store.settings().get("sub") or {},
+                "stats": store.sub_stats(),
+                "last": store.get_kv("sub_last_run", {}) or {},
+            })
+
+        if path == "/api/subs/state":
+            return self._send(200, {"ok": True, "state": subs.state()})
+
+        if path == "/api/subs/log":
+            return self._send(200, {"ok": True, "logs": store.sub_logs(int(g("limit", 80))),
+                                    "stats": store.sub_stats()})
 
         if path == "/api/item":
             it = store.get_item(g("id"))
@@ -277,7 +358,14 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/115/quota":
             c = pan.Pan115()
-            return self._send(200, {"ok": True, **c.quota()})
+            out = {"ok": True, **c.quota()}
+            # 离线配额（约 1.5T，下载临时空间）和网盘空间（100T 级）是两回事，
+            # 页面上分开显示，免得「剩 132G」被当成网盘要满了
+            try:
+                out["space"] = c.space()
+            except Exception as e:
+                out["space"] = {"ok": False, "err": f"{type(e).__name__}: {e}"[:120]}
+            return self._send(200, out)
 
         if path == "/api/115/tasks":
             c = pan.Pan115()
@@ -302,11 +390,236 @@ class Handler(BaseHTTPRequestHandler):
             c = pan.Pan115()
             return self._send(200, {"ok": True, **c.file_info(g("file_id"))})
 
+        if path == "/api/debug/115/probe":
+            # 排障：试探 115 接口地址（只允许 115 域名，避免变成任意 URL 代理）
+            u = g("url") or ""
+            if not re.match(r"^https://(?:webapi|clouddownload|115)\.115\.com/", u):
+                return self._send(400, {"ok": False, "msg": "只允许 115 域名"})
+            return self._send(200, pan.Pan115().probe(u))
+
+        if path == "/api/debug/site/pan":
+            # 排障：看详情页里的「网盘」资源长什么样（盘种 / 链接 / 是否分集）
+            iid = g("id") or ""
+            it = store.get_item(iid) or {}
+            url = it.get("url") or g("url") or ""
+            if not url:
+                return self._send(400, {"ok": False, "msg": "缺少条目"})
+            sc = site.SiteClient()
+            try:
+                p = sc.fetch_page(url)
+            except site.SiteError as e:
+                return self._send(200, {"ok": False, "msg": str(e), "url": url})
+            obj, html = p.get("obj"), p.get("html") or ""
+            d = obj.get("d") if isinstance(obj, dict) else None
+            PAT = (r"pan\.quark\.cn|drive\.quark\.cn|pan\.baidu\.com|aliyundrive\.com|"
+                   r"alipan\.com|cloud\.189\.cn|123pan\.com|pan\.xunlei\.com|"
+                   r"drive\.uc\.cn|115\.com/s/|115cdn\.com")
+            hosts = {}
+            for m in re.finditer(PAT, html):
+                k = m.group(0)
+                hosts[k] = hosts.get(k, 0) + 1
+            frags = []
+            for m in re.finditer(r"https?://[^\"'\s<>]{6,160}", html):
+                u = m.group(0)
+                if re.search(PAT, u) and u not in frags:
+                    frags.append(u)
+            around = []
+            for kw in ("网盘", "夸克", "百度", "阿里", "迅雷", "123"):
+                i = html.find(kw)
+                if i >= 0:
+                    around.append(re.sub(r"\s+", " ",
+                                         html[max(0, i - 90):i + 150]))
+            # 网盘链接大概率在独立接口里：把 cblist 和一批候选路径都探一遍
+            cblist = obj.get("cblist") if isinstance(obj, dict) else None
+            dj = d if isinstance(d, dict) else {}
+            dirname = str(dj.get("dir") or g("cat") or "tv")
+            ident = str(dj.get("id") or g("iid") or "")
+            tries = {}
+            if ident:
+                for cand in ("panurl", "pandownurl", "pan", "wangpan", "purl",
+                             "downpan", "pan_downurl", "pandown", "cloudurl"):
+                    pth = f"/res/{cand}/{dirname}/{ident}"
+                    try:
+                        st, txt = sc.get(pth, referer=url)
+                        tries[pth] = [st, (txt or "")[:400]]
+                    except site.SiteError as e:
+                        tries[pth] = ["ERR", str(e)[:120]]
+                    except Exception as e:
+                        tries[pth] = ["ERR", f"{type(e).__name__}: {e}"[:120]]
+            try:
+                st0, txt0 = sc.get(f"/res/downurl/{dirname}/{ident}", referer=url)
+                tries["/res/downurl/... (基线)"] = [st0, (txt0 or "")[:300]]
+            except Exception as e:
+                st0, txt0 = 0, ""
+                tries["/res/downurl/... (基线)"] = ["ERR", str(e)[:120]]
+            try:
+                j0 = json.loads(txt0 or "{}")
+            except Exception:
+                j0 = {}
+            pl = j0.get("panlist") or {}
+            paninfo = {"keys": list(pl.keys())[:20] if isinstance(pl, dict) else type(pl).__name__,
+                       "n": len(pl.get("id") or []) if isinstance(pl, dict) else 0}
+            if isinstance(pl, dict) and pl.get("id"):
+                paninfo["sample"] = {
+                    k: (v[:5] if isinstance(v, list) else str(v)[:120])
+                    for k, v in pl.items() if not isinstance(v, dict)}
+                for k, v in pl.items():
+                    if isinstance(v, dict):
+                        paninfo["sample"][k] = {kk: (str(vv)[:90]) for kk, vv in list(v.items())[:6]}
+                # type 是 tname 的下标：按盘种分组统计，并给出每种的样例链接
+                tnames = pl.get("tname") or []
+                urls0 = pl.get("url") or []
+                names0 = pl.get("name") or []
+                types0 = pl.get("type") or []
+                groups = {}
+                for i, tp in enumerate(types0):
+                    try:
+                        lab = tnames[int(tp)]
+                    except (IndexError, ValueError, TypeError):
+                        lab = f"?{tp}"
+                    g = groups.setdefault(lab, {"n": 0, "urls": [], "names": []})
+                    g["n"] += 1
+                    if len(g["urls"]) < 3:
+                        g["urls"].append(str(urls0[i])[:120] if i < len(urls0) else "")
+                        g["names"].append(str(names0[i])[:90] if i < len(names0) else "")
+                paninfo["groups"] = groups
+            return self._send(200, {"ok": True, "url": url, "len": len(html),
+                                    "pan": paninfo,
+                                    "cblist": str(cblist)[:900],
+                                    "d": {k: str(v)[:100] for k, v in dj.items()},
+                                    "tries": tries,
+                                    "obj_keys": list(obj.keys())[:24] if isinstance(obj, dict) else [],
+                                    "hosts": hosts, "urls": frags[:20],
+                                    "around": around[:6]})
+
+        if path == "/api/debug/site/pan115":
+            # 排障：这条片子的 115 网盘分享（磁力全死时的兜底源）
+            iid = g("id") or ""
+            it = store.get_item(iid) or {}
+            url = it.get("url") or g("url") or ""
+            if not url:
+                return self._send(400, {"ok": False, "msg": "缺少条目"})
+            sc = site.SiteClient()
+            try:
+                p = sc.fetch_page(url)
+            except site.SiteError as e:
+                return self._send(200, {"ok": False, "msg": str(e), "url": url})
+            d = p.get("obj") if isinstance(p.get("obj"), dict) else {}
+            dj = d.get("d") if isinstance(d.get("d"), dict) else {}
+            dirname = str(dj.get("dir") or g("cat") or "tv")
+            ident = str(dj.get("id") or g("iid") or "")
+            raw = sc.downurl_raw(dirname, ident) if ident else {}
+            kind = g("kind", "115")
+            pans = site.pans_from_downurl(raw)
+            if kind != "all":
+                if kind == "115":
+                    pans = [x for x in pans if x.get("is_115")]
+                else:
+                    pans = [x for x in pans
+                            if kind in str(x.get("kind") or "")
+                            or kind in str(x.get("url") or "").lower()]
+            return self._send(200, {"ok": True, "url": url, "n": len(pans),
+                                    "bad": sorted(store.pan_bad_urls())[:20],
+                                    "items": pans[:60]})
+
+        if path == "/api/debug/115/share":
+            # 排障：验一条 115 分享（默认只看不转；save=1 才真转存）
+            u = g("url") or ""
+            pwd = g("pwd") or ""
+            if not pan.parse_share(u)[0]:
+                return self._send(400, {"ok": False, "msg": "只支持 115 分享链接"})
+            c = pan.Pan115()
+            code, pwd2 = pan.parse_share(u)
+            snap = c.share_ls(code, pwd or pwd2)
+            out = {"ok": snap.get("ok"), "code": code, "msg": snap.get("msg"),
+                   "count": snap.get("count"),
+                   "items": [{k: x.get(k) for k in ("name", "size", "is_dir")}
+                             for x in (snap.get("list") or [])][:40]}
+            if str(g("save", "0")) == "1":
+                cid = g("cid") or jobs._save_path(store.settings(), g("cat") or "")
+                want = g("eps") or ""
+                want_eps = [int(x) for x in re.split(r"[,\s]+", want) if x.isdigit()] \
+                    if want else None
+                out["pull"] = c.share_pull(u, pwd or pwd2, cid=str(cid or "0"),
+                                            want_eps=want_eps,
+                                            allow_pack=str(g("pack", "0")) == "1")
+            return self._send(200, out)
+
         if path == "/api/debug/115/files":
             c = pan.Pan115()
             return self._send(200, {"ok": True, **c.files(cid=int(g("cid", "0") or 0),
                                                         keyword=g("q") or None,
                                                         limit=int(g("limit", "30") or 30))})
+
+        if path == "/api/debug/115/ls":
+            c = pan.Pan115()
+            pth = g("path") or "/"
+            cid = c.cid_of(pth)
+            if not cid:
+                return self._send(200, {"ok": False, "msg": "路径不存在", "path": pth})
+            r = c.files(cid=int(cid), limit=int(g("limit", "100") or 100))
+            items = [{"name": x.get("name"), "is_dir": bool(x.get("is_dir")),
+                      "size": x.get("size"), "size_txt": x.get("size_txt"),
+                      "t": x.get("t")} for x in (r.get("items") or [])]
+            return self._send(200, {"ok": True, "path": pth, "cid": str(cid),
+                                    "n": len(items), "items": items})
+
+        if path == "/api/debug/115/tasks":
+            c = pan.Pan115()
+            out = []
+            total = None
+            pages = max(1, min(6, int(g("pages", "4") or 4)))
+            for pg in range(1, pages + 1):
+                r = c.tasks(page=pg, page_size=50)
+                if total is None:
+                    total = r.get("count")
+                lst = r.get("tasks") or []
+                for t in lst:
+                    out.append({"h": str(t.get("info_hash") or "").lower(),
+                                "name": str(t.get("name") or "")[:64],
+                                "pc": t.get("percentDone"), "st": t.get("status"),
+                                "size": t.get("size")})
+                if len(lst) < 50:
+                    break
+            return self._send(200, {"ok": True, "count": total,
+                                    "n": len(out), "tasks": out})
+
+        if path == "/api/debug/115/reap":
+            # 手动跑一次死种收尾：?hash=a,b 只判死这几条；否则按宽限期跑全量。
+            from . import jobs as _jobs
+            hs = [x.strip() for x in (g("hash") or "").split(",") if x.strip()]
+            if hs:
+                r = _jobs.kill_hashes(pan.Pan115(), hs,
+                                      str(g("why") or "手动判死"))
+                return self._send(200, {"ok": True, **r})
+            h = g("hours")
+            try:
+                age = float(h) if h not in (None, "") else None
+            except ValueError:
+                age = None
+            r = _jobs._reap_tasks(pan.Pan115(), min_age_h=age)
+            return self._send(200, {"ok": True, **r})
+
+        if path == "/api/debug/115/add":
+            h = (g("hash") or "").lower()
+            m = g("magnet") or ""
+            if not m and not h:
+                return self._send(400, {"ok": False, "msg": "缺少 hash / magnet"})
+            mg = m or f"magnet:?xt=urn:btih:{h}"
+            r = pan.Pan115().add_magnet(mg)
+            return self._send(200, {"ok": bool(r.get("ok")), "raw": r})
+
+        if path == "/api/debug/115/deltask":
+            h = (g("hash") or "").lower()
+            if not h:
+                return self._send(400, {"ok": False, "msg": "缺少 hash"})
+            files = str(g("files", "0")).lower() not in ("0", "false", "no", "")
+            return self._send(200, {"ok": True,
+                                    **pan.Pan115().del_task(h, del_files=files)})
+
+        if path == "/api/debug/115/bad":
+            return self._send(200, {"ok": True, "n": len(store.bad_hashes()),
+                                    "bad": store.bad_detail()})
 
         if path == "/api/debug/115/find":
             h = g("hash") or ""
@@ -383,6 +696,23 @@ class Handler(BaseHTTPRequestHandler):
                 out["html"] = html[:int(g("html", "6000"))]
             return self._send(200, out)
 
+        # ---- 手动转存（磁力 / 115网盘 两个按钮）----
+        if path == "/api/convert/status":
+            tid = g("id") or ""
+            with _lock:
+                if tid:
+                    t = dict(_conv_tasks.get(tid) or {})
+                else:
+                    # 不带 id：返回当前最值得看的任务（运行中优先，否则最新一条）
+                    running = {k: v for k, v in _conv_tasks.items()
+                               if v.get("state") in ("running", "queued")}
+                    t = dict(_conv_tasks[max(running or _conv_tasks)]) if _conv_tasks else {}
+                    if t:
+                        t["id"] = max(running or _conv_tasks)
+            if not t:
+                return self._send(200, {"ok": False, "msg": "任务不存在或已过期"})
+            return self._send(200, {"ok": True, **t})
+
         return self._send(404, {"ok": False, "msg": "unknown api"})
 
     # ---------- POST ----------
@@ -401,6 +731,7 @@ class Handler(BaseHTTPRequestHandler):
             if res.get("ok"):
                 store.save_settings({"site": {"username": username, "password": password}})
                 store.set_kv("nologin_notified", 0)
+                store.set_kv("nologin_at", 0)
                 store.log(f"站点登录成功: {username}", "ok")
                 return self._send(200, {"ok": True, "msg": "登录成功"})
             if res.get("captcha"):
@@ -486,6 +817,174 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_run, daemon=True).start()
             return self._send(200, {"ok": True, "count": len(targets), "msg": "已开始洗版"})
 
+        if path == "/api/subs/add":
+            raw = str(body.get("kw") or body.get("title") or "").strip()
+            if not raw:
+                return self._send(200, {"ok": False, "msg": "先填片名"})
+            # 从卡片/候选点进来的是站点原始标题（带画质、广告、年份），先洗成片名
+            kw = subs.clean_kw(raw) or raw
+            year = str(body.get("year") or "").strip()
+            if not year:
+                year = subs.year_of({"title": raw, "sub": body.get("sub") or ""})
+            try:
+                sid, created = store.sub_add({
+                    "kw": kw,
+                    "cat": body.get("cat") or "",
+                    "year": year,
+                    "season": body.get("season") or 0,
+                    "qmin": body.get("qmin") or body.get("resolution") or "",
+                    "min_gb": body.get("min_gb") or 0,
+                    "max_gb": body.get("max_gb") or 0,
+                    "auto_wash": body.get("auto_wash", True),
+                    "best_version": body.get("best_version", body.get("auto_wash", True)),
+                    "best_version_full": body.get("best_version_full") or 0,
+                    "wait_end": body.get("wait_end", True),
+                    "ep_mode": body.get("ep_mode") or "",
+                    "ep_from": body.get("ep_from") or 0,
+                    "filter_inc": body.get("filter_inc") or "",
+                    "filter_exc": body.get("filter_exc") or "",
+                    "effect": body.get("effect") or "",
+                    "search_interval": body.get("search_interval") or 0,
+                    "media_id": body.get("media_id") or body.get("item_id") or "",
+                    "save_path": body.get("save_path") or "",
+                })
+            except ValueError as e:
+                return self._send(200, {"ok": False, "msg": str(e)})
+            if not created:
+                return self._send(200, {"ok": True, "id": sid, "dup": True,
+                                        "msg": "这个片子已经在订阅里了"})
+            store.log(f"新增订阅：{kw}" + (f"（{year}）" if year else ""), "ok")
+            store.sub_log(sid, kw, "add", "已加入订阅")
+            r = subs.run(ids=[sid])
+            return self._send(200, {"ok": True, "id": sid, "created": True, "run": r,
+                                    "msg": "已订阅，马上查一遍片源" if r.get("started")
+                                           else "已订阅，稍后自动检查"})
+
+        if path == "/api/subs/update":
+            sid = int(body.get("id") or 0)
+            cur = store.sub_get(sid)
+            if not cur:
+                return self._send(404, {"ok": False, "msg": "订阅不存在"})
+            patch = {}
+            for k in ("cat", "year", "qmin", "min_gb", "max_gb"):
+                if k in body:
+                    patch[k] = body[k] if k in ("min_gb", "max_gb") else str(body[k] or "")
+            # MP V3 模型的新字段
+            for k in ("filter_inc", "filter_exc", "effect", "save_path"):
+                if k in body:
+                    patch[k] = str(body.get(k) or "")[:200]
+            for k in ("season", "search_interval", "best_version_full",
+                      "best_version", "auto_wash", "wait_end", "enabled",
+                      "start_episode", "total_episode"):
+                if k in body:
+                    try:
+                        patch[k] = max(0, int(float(body.get(k) or 0)))
+                    except (TypeError, ValueError):
+                        patch[k] = 0
+            if "best_version" in patch:
+                patch["auto_wash"] = patch["best_version"]
+            if "ep_mode" in body:
+                em = str(body.get("ep_mode") or "").strip().lower()
+                patch["ep_mode"] = em if em in ("follow", "all") else ""
+            if "ep_from" in body:
+                try:
+                    patch["ep_from"] = max(0, int(float(body.get("ep_from") or 0)))
+                except (TypeError, ValueError):
+                    patch["ep_from"] = 0
+            # 复用 V3 状态机：enabled=0 等价于 S（暂停）
+            if patch.get("enabled") == 0:
+                patch["state"] = "S"
+            elif patch.get("enabled") == 1:
+                patch["state"] = "R"
+            # 追更本身就是不等完结；两个开关别互相打架
+            if patch.get("ep_mode") == "follow":
+                patch["wait_end"] = 0
+            if "kw" in body:
+                new_kw = subs.clean_kw(str(body.get("kw") or "")) or str(body.get("kw") or "").strip()
+                if new_kw:
+                    patch["kw"] = new_kw
+            # 换了目标（片名/栏目/年份）就等于重新订阅：旧的推送记录清空，
+            # 否则新目标会被旧的 btih 卡住，永远「已是最佳」
+            if any(k in patch and str(patch[k]) != str(cur.get(k) or "")
+                   for k in ("kw", "cat", "year")):
+                patch.update(btih="", item_id="", title="", size_text="",
+                             size_bytes=0, qscore=0, status="waiting")
+            # 改了剧集更新方式 / 起始集：追更进度要归零，否则新设置根本不生效
+            elif (("ep_mode" in patch and str(patch["ep_mode"]) != str(cur.get("ep_mode") or ""))
+                  or ("ep_from" in patch
+                      and int(patch["ep_from"] or 0) != int(cur.get("ep_from") or 0))):
+                patch.update(btih="", size_text="", size_bytes=0, qscore=0,
+                             last_ep=0, ep_done="", status="waiting",
+                             state="N", current_priority=0, note="[]",
+                             episode_priority="{}")
+            # 改了过滤规则 / 最低画质：基线作废，重新按新规则判一次洗版
+            elif any(k in patch and str(patch[k]) != str(cur.get(k) or "")
+                     for k in ("filter_inc", "filter_exc", "qmin", "effect")):
+                patch.update(current_priority=0)
+            store.sub_update(sid, **patch)
+            sub = store.sub_get(sid)
+            # 暂停中恢复、改了追更方式 / 起始集 / 过滤规则，都立刻按新规则查一遍
+            if (patch.get("enabled") == 1 or "ep_mode" in patch
+                    or "ep_from" in patch or "filter_inc" in patch
+                    or "filter_exc" in patch or "qmin" in patch):
+                subs.run(ids=[sid])
+            store.log(f"订阅已更新：{sub.get('kw')}", "info")
+            return self._send(200, {"ok": True, "sub": sub})
+
+        if path == "/api/subs/status":
+            # 改状态机：N 新建 / R 订阅中 / P 待定 / S 暂停
+            sid = int(body.get("id") or 0)
+            if not store.sub_get(sid):
+                return self._send(404, {"ok": False, "msg": "订阅不存在"})
+            st = str(body.get("state") or "").upper()[:1]
+            if st not in ("N", "R", "P", "S"):
+                return self._send(400, {"ok": False, "msg": "state 只能是 N/R/P/S"})
+            store.sub_state_set(sid, st)
+            sub = store.sub_get(sid)
+            store.sub_log(sid, sub.get("kw"), "state",
+                          f"状态改为 {subs.STATE_LABEL.get(st, st)}")
+            if st in ("N", "R"):
+                subs.run(ids=[sid])
+            return self._send(200, {"ok": True, "sub": sub})
+
+        if path == "/api/subs/del":
+            sid = int(body.get("id") or 0)
+            sub = store.sub_get(sid)
+            if not sub:
+                return self._send(404, {"ok": False, "msg": "订阅不存在"})
+            store.sub_del(sid)
+            store.log(f"已删除订阅：{sub.get('kw')}", "info")
+            return self._send(200, {"ok": True})
+
+        if path == "/api/subs/check":
+            sid = int(body.get("id") or 0)
+            r = subs.run(ids=[sid] if sid else None)
+            return self._send(200, r)
+
+        if path == "/api/subs/find":
+            r = subs.find(str(body.get("kw") or ""), limit=int(body.get("limit") or 20))
+            return self._send(200, r)
+
+        if path == "/api/subs/log/clear":
+            n = store.sub_log_clear()
+            return self._send(200, {"ok": True, "deleted": n})
+
+        if path == "/api/subs/config":
+            patch = {}
+            if "enabled" in body:
+                patch["enabled"] = bool(body.get("enabled"))
+            for k in ("pan_fallback", "pan_allow_pack"):
+                if k in body:
+                    patch[k] = bool(body.get(k))
+            for k in ("interval", "max_per_run", "delay", "pan_max_try"):
+                if k in body:
+                    try:
+                        patch[k] = max(1, int(float(body.get(k) or 0)))
+                    except (TypeError, ValueError):
+                        pass
+            cfg = store.save_settings({"sub": patch})
+            return self._send(200, {"ok": True, "sub": cfg["sub"]})
+
         if path == "/api/push":
             item_id = body.get("item_id")
             if not item_id:
@@ -498,12 +997,69 @@ class Handler(BaseHTTPRequestHandler):
             store.log("已退出 115 登录", "warn")
             return self._send(200, {"ok": True})
 
+        if path == "/api/115/mkdir":
+            # 115 上建目录（逐级），给按栏目分目录用；已存在则直接返回现有 cid
+            p = (body.get("path") or "").strip()
+            if not p:
+                return self._send(400, {"ok": False, "msg": "缺少 path"})
+            c = pan.Pan115()
+            if not c.logged_in():
+                return self._send(200, {"ok": False, "msg": "115 未登录"})
+            r = c.mkdir(p)
+            if r.get("ok") and r.get("created"):
+                store.log(f"已新建 115 目录：{r['path']}", "ok")
+            return self._send(200, r)
+
         if path == "/api/115/savepath":
             pid = str(body.get("id", "") or "")
             name = body.get("name") or ""
-            cfg = store.save_settings({"pan": {"save_path_id": pid, "save_path_name": name}})
-            store.log(f"115 保存目录已设为：{name or '根目录'}", "ok")
+            cat = str(body.get("cat") or "")
+            # 按栏目存：电视剧和电影用不同目录，后面自己整理时不会混在一起
+            if cat in ("mv", "tv", "ac"):
+                pan_cfg = dict(store.settings().get("pan") or {})
+                paths = dict(pan_cfg.get("paths") or {})
+                if pid:
+                    paths[cat] = {"id": pid, "name": name}
+                else:
+                    paths.pop(cat, None)
+                pan_cfg["paths"] = paths
+                cfg = store.save_settings({"pan": pan_cfg})
+                label = {"mv": "电影", "tv": "电视剧", "ac": "动漫"}.get(cat, cat)
+                store.log(f"{label}的 115 保存目录已设为：{name or '跟随默认目录'}", "ok")
+            else:
+                cfg = store.save_settings({"pan": {"save_path_id": pid, "save_path_name": name}})
+                store.log(f"115 默认保存目录已设为：{name or '根目录'}", "ok")
             return self._send(200, {"ok": True, "pan": cfg["pan"]})
+
+        # ---- 手动转存（磁力 / 115网盘 两个按钮）----
+        if path == "/api/convert":
+            item_id = body.get("item_id")
+            mode = str(body.get("mode") or "").strip()
+            if not item_id:
+                return self._send(400, {"ok": False, "msg": "缺少 item_id"})
+            if mode not in ("magnet", "pan115"):
+                return self._send(400, {"ok": False, "msg": "未知路线"})
+            magnet = body.get("magnet") or None
+            eps = body.get("eps") or None
+            want_eps = None
+            if eps:
+                try:
+                    want_eps = [int(x) for x in (eps if isinstance(eps, list)
+                                                  else re.split(r"[,\s]+", str(eps))) if str(x).isdigit()]
+                except Exception:
+                    want_eps = None
+            with _lock:
+                _conv_seq[0] += 1
+                tid = str(_conv_seq[0])
+                _conv_tasks[tid] = {"state": "queued", "mode": mode, "item_id": str(item_id),
+                                    "ok": False, "msg": "排队中", "result": {}, "started": time.time()}
+            threading.Thread(target=_conv_run,
+                             kwargs={"tid": tid, "item_id": item_id, "mode": mode,
+                                     "magnet": magnet, "want_eps": want_eps},
+                             daemon=True).start()
+            return self._send(200, {"ok": True, "id": tid,
+                                    "msg": "已开始" + {"magnet": "磁力离线",
+                                                    "pan115": "115 网盘转存"}.get(mode, "转存")})
 
         return self._send(404, {"ok": False, "msg": "unknown api"})
 
@@ -512,6 +1068,7 @@ def main():
     store.init()
     store.log("服务启动", "info")
     jobs.start()
+    subs.start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     print(f"[jiaofu115] listening on :{PORT}", flush=True)

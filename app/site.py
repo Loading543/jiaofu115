@@ -81,7 +81,9 @@ _Q_SRC = [
     (r"web", 3, "WEB"),
     (r"hdtv|hdrip", 2, "HDTV"),
     (r"dvdrip|dvd", 1, "DVDRip"),
-    (r"\bcam\b|\bts\b|\btc\b|枪版|抢先", 0, "枪版"),
+    # 枪版：cam/ts/tc 经常粘在来源后面写成 HDTS、HDTC、HD-TS，
+    # 只写 \bts\b 抓不到，所以单独列出来。
+    (r"\bcam\b|\bts\b|\btc\b|hdt[sc]|hd-?ts|hd-?tc|telesync|telecine|枪版|抢先", 0, "枪版"),
 ]
 
 
@@ -123,10 +125,17 @@ def quality_of(label):
 
 
 def pick_best_quality(magnets):
-    """按质量分选最优，同分取体积大的。"""
+    """按质量分选最优，同分取体积大的。
+
+    枪版/抢先版只要还有正常版本就不参与 —— 4K 的枪版不如 1080p 的正片，
+    洗版时更不能拿它去替换已经收好的正片。
+    """
+    cand = [(m, quality_of(m.get("label") or m.get("url") or "")) for m in (magnets or [])]
+    normal = [(m, q) for m, q in cand if q.get("src") != "枪版"]
+    if normal:
+        cand = normal
     best, best_key = None, None
-    for m in magnets or []:
-        q = quality_of(m.get("label") or m.get("url") or "")
+    for m, q in cand:
         key = (q["q"], int(m.get("size_bytes") or 0))
         if best_key is None or key > best_key:
             best, best_key = m, key
@@ -181,8 +190,19 @@ class SiteClient:
     def save_cookies(self):
         store.set_site_cookies(self.cookie_dict())
 
+    # 站点不同时期下发过不同名字的登录 cookie：老版是 uid / auth，现在用的是 app_auth。
+    # 只认死其中一两个名字，站点一改版就会把「已登录」误判成「未登录」，
+    # 而且这种误判不会报错，只会让自动抓取静默停摆 —— 之前就这样白停了两天。
+    _AUTH_COOKIE_NAMES = ("uid", "auth", "app_auth", "user_auth", "access_token")
+
     def logged_in(self):
-        return bool(self.cookie_dict().get("uid") or self.cookie_dict().get("auth"))
+        for name, val in self.cookie_dict().items():
+            n = (name or "").lower()
+            if not val:
+                continue
+            if n in self._AUTH_COOKIE_NAMES or n.endswith("_auth"):
+                return True
+        return False
 
     def rotate_session(self, drop_pow=True):
         """被限流后换一个干净会话：丢掉 PoW cookie，让站点重新下发挑战。"""
@@ -356,12 +376,29 @@ class SiteClient:
             st, html = self.get("/")
         except SiteError as e:
             return {"ok": False, "msg": str(e)}
-        if "未登录" in html and len(html) < 3000:
-            res = {"ok": False, "msg": "未登录或登录已失效"}
-        else:
-            res = {"ok": True, "msg": "已登录"}
+        res = self._judge_login(st, html)
         _login_cache.update(ts=now, ok=res["ok"], msg=res["msg"])
         return res
+
+    def _judge_login(self, st, html):
+        """判断这一页是不是「登录后的页面」。
+
+        不能只看有没有「未登录」三个字：站点限流时返回的是几百字节的 JS 验证页，
+        里面一个标记都没有，按老逻辑会被当成「已登录」—— 于是自动抓取一直以为
+        自己是好的，实际早就停了。
+        """
+        if st != 200:
+            return {"ok": False, "msg": f"站点返回 HTTP {st}"}
+        if "未登录" in html:
+            return {"ok": False, "msg": "未登录或登录已失效"}
+        user = ((store.settings().get("site") or {}).get("username") or "").strip()
+        if user and user in html:
+            return {"ok": True, "msg": "已登录"}
+        if len(html) < 1500:
+            return {"ok": False, "msg": "站点只返回了验证页，会话可能已失效"}
+        if not self.parse_obj(html):
+            return {"ok": False, "msg": "页面结构异常，会话可能已失效"}
+        return {"ok": True, "msg": "已登录"}
 
     # ---------- parsing ----------
     def parse_obj(self, html):
@@ -427,7 +464,7 @@ class SiteClient:
         """真实分页是 /{cat}?page=N，每页 48 条；_obj.page 里带总页数。"""
         path = f"/{cat}" if page <= 1 else f"/{cat}?page={int(page)}"
         p = self.fetch_page(path)
-        items = normalize_items(p["obj"], cat, self.base)
+        items = normalize_items(p["obj"], cat, self.base, page=page)
         meta = p["obj"].get("page") if isinstance(p["obj"], dict) else {}
         meta = meta if isinstance(meta, dict) else {}
         return {"items": items,
@@ -541,20 +578,28 @@ class SiteClient:
         meta = p["obj"].get("page") if isinstance(p["obj"], dict) else {}
         return int((meta or {}).get("pages") or 0)
 
-    def downurl(self, dirname, iid):
-        """磁力在独立接口里：GET /res/downurl/{dir}/{id}"""
+    def downurl_raw(self, dirname, iid):
+        """磁力/网盘都在这个接口里：GET /res/downurl/{dir}/{id}
+
+        返回原始 JSON。网盘（panlist）以前被整段丢掉，导致「磁力全死」
+        时完全没有备用源 —— 现在磁力和网盘都从这一份里解析。
+        """
         referer = f"{self.base}/{dirname}/{iid}"
         try:
             st, txt = self.get(f"/res/downurl/{dirname}/{iid}", referer=referer)
         except SiteError:
-            return []
+            return {}
         if st != 200:
-            return []
+            return {}
         try:
             j = json.loads(txt)
         except Exception:
-            return []
-        return magnets_from_downurl(j)
+            return {}
+        return j if isinstance(j, dict) else {}
+
+    def downurl(self, dirname, iid):
+        """磁力在独立接口里：GET /res/downurl/{dir}/{id}"""
+        return magnets_from_downurl(self.downurl_raw(dirname, iid))
 
     def search(self, keyword):
         path = "/search?q=" + urllib.parse.quote(keyword)
@@ -574,12 +619,14 @@ class SiteClient:
             iid = url.rstrip("/").rsplit("/", 1)[-1].split(".")[0]
         p = self.fetch_page(url)
         info = normalize_detail(p["obj"], self.base)
-        magnets = self.downurl(dirname, iid)
+        raw = self.downurl_raw(dirname, iid)
+        magnets = magnets_from_downurl(raw)
         if not magnets:
             magnets = extract_magnets(p["obj"], self.base)
         if not magnets:
             magnets = magnets_from_html(p["html"])
         info["magnets"] = _dedup_magnets(magnets)
+        info["pans"] = _dedup_pans(pans_from_downurl(raw))
         info["raw_type"] = p["type"]
         info["dir"], info["iid"] = dirname, iid
         return info
@@ -680,13 +727,15 @@ TAGS = [
     "短片", "校园", "文艺", "运动", "青春", "同性", "励志", "人性", "美食",
     "女性", "治愈", "历史", "真人秀", "脱口秀", "萌系", "日常", "热血",
     "机战", "游戏", "情色", "搞笑", "恋爱", "后宫", "百合", "基腐", "致郁",
-    "异世界", "泡面", "战斗", "加拿大", "香港", "台湾", "韩国", "印度",
+    "异世界", "泡面", "战斗", "加拿大", "中国香港", "中国台湾", "韩国", "印度",
     "德国", "法国", "英国", "意大利", "巴西", "泰国", "澳大利亚", "荷兰",
     "西班牙", "墨西哥",
 ]
 
 IMG_HOST = "https://s.tutu.pm"
 DIR_NAMES = {"mv": "电影", "tv": "电视剧", "ac": "动漫"}
+# 站点列表每页固定 48 条（前端分页、NEW_ZONE 都按这个数算）
+PAGE_SIZE = 48
 
 
 def _cell(cols, key, idx, default=None):
@@ -718,14 +767,20 @@ def _tag_text(a):
     return " · ".join(parts)
 
 
-def _decode_cols(block, cat, base):
-    """列式解码：{字段: [值...]} -> 条目列表。站点所有列表页都是这个结构。"""
+def _decode_cols(block, cat, base, page=None):
+    """列式解码：{字段: [值...]} -> 条目列表。站点所有列表页都是这个结构。
+
+    page 非空时给每条附一个 pos（站点绝对位次，越小越新）。站点列表页没有
+    任何时间字段，唯一的「排序信息」就是它出现在第几页第几条 —— 首页第 1 条
+    就是最新更新。所以想按网站顺序展示，只能把这个位次存下来。
+    """
     if not isinstance(block, dict):
         return []
     cols = {k: v for k, v in block.items() if isinstance(v, list)}
     ids = cols.get("i")
     if not isinstance(ids, list) or not ids:
         return []
+    pos_base = (int(page) - 1) * PAGE_SIZE if page else None
     # 有些板块用 ty 数字区分栏目（1=mv 2=tv 3=ac）
     ty = block.get("ty")
     dirs = ["mv", "tv", "ac"]
@@ -769,13 +824,16 @@ def _decode_cols(block, cat, base):
             "url": f"{base}/{slug}/{iid}",
             "poster": poster_url(slug, iid),
             "sub": sub.strip(" ·")[:90],
+            # 更新状态：全24集 / 更新至12集 / 预告 / ?集 —— 用来判断「刚完结」
+            "stat": str(_cell(cols, "g", idx) or "").strip()[:16],
             "ts": 0,
+            "pos": (pos_base + idx) if pos_base is not None else None,
             "heat": _cell(cols, "r", idx) or 0,
         })
     return out
 
 
-def decode_items(obj, cat, base):
+def decode_items(obj, cat, base, page=None):
     """把页面 obj 里所有列式板块展开成条目"""
     blocks = []
     inl = obj.get("inlist")
@@ -796,7 +854,7 @@ def decode_items(obj, cat, base):
             blocks.extend([b for b in v if isinstance(b, dict) and isinstance(b.get("i"), list)])
     out, seen = [], set()
     for b in blocks:
-        for it in _decode_cols(b, cat, base):
+        for it in _decode_cols(b, cat, base, page=page):
             if it["id"] in seen:
                 continue
             seen.add(it["id"])
@@ -854,9 +912,9 @@ def decode_search(sr, base):
     return out
 
 
-def normalize_items(obj, cat, base):
+def normalize_items(obj, cat, base, page=None):
     """兼容入口：优先列式解码，失败再退回旧的行式探测"""
-    items = decode_items(obj, cat, base)
+    items = decode_items(obj, cat, base, page=page)
     if items:
         return items
     out = []
@@ -974,6 +1032,131 @@ def magnets_from_downurl(j):
     return direct or packed
 
 
+# ---------------- 网盘资源（panlist） ----------------
+# 站点的 panlist 是「列式」结构：一份记录拆成 12 个平行数组，靠下标对齐。
+#   {"id":[...], "name":[...], "p":[提取码], "url":[...], "type":[盘种下标],
+#    "tname":["迅雷网盘","百度网盘","夸克网盘","115网盘","123网盘"], ...}
+# type 是 tname 的下标，不是固定枚举 —— 不同条目的 tname 顺序会变，必须查表。
+_PAN_KIND_BY_HOST = [
+    (("115.com", "115cdn.com", "anxia.com"), "115网盘"),
+    (("quark.cn",), "夸克网盘"),
+    (("baidu.com",), "百度网盘"),
+    (("aliyundrive.com", "alipan.com"), "阿里网盘"),
+    (("xunlei.com",), "迅雷网盘"),
+    (("123pan.com", "123684.com"), "123网盘"),
+    (("189.cn",), "天翼网盘"),
+    (("uc.cn",), "UC网盘"),
+    (("guangyapan.com",), "光鸭网盘"),
+    (("caiyun.139.com",), "移动网盘"),
+]
+
+_PWD_IN_URL = re.compile(r"[?&#](?:password|pwd|code|passcode)=([A-Za-z0-9]{2,12})", re.I)
+_PWD_IN_TEXT = re.compile(r"(?:访问码|提取码|密码|密碼)\s*[：:=]?\s*([A-Za-z0-9]{4,12})")
+_SHARE_CODE = re.compile(r"https?://(?:www\.)?(?:115|115cdn|anxia)\.com/s/([A-Za-z0-9]+)")
+
+
+def pan_kind_of(url, tname=None, tidx=None):
+    """判断网盘类型：优先用站点给的 tname 表，认不出再按域名猜。"""
+    if isinstance(tname, list) and tidx is not None:
+        try:
+            k = str(tname[int(tidx)] or "").strip()
+            if k:
+                return k
+        except (IndexError, TypeError, ValueError):
+            pass
+    host = urllib.parse.urlparse(str(url or "")).netloc.lower()
+    for keys, name in _PAN_KIND_BY_HOST:
+        if any(k in host for k in keys):
+            return name
+    return "其他网盘"
+
+
+def pan_pwd_of(url, p=""):
+    """提取码：列里的 p → URL 里的 ?password= → 文本里的「访问码：xxxx」。"""
+    for cand in (p, url):
+        s = str(cand or "")
+        if not s:
+            continue
+        m = _PWD_IN_URL.search(s) or _PWD_IN_TEXT.search(s)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def pans_from_downurl(j):
+    """解析 /res/downurl 里的 panlist，返回统一的网盘候选列表。
+
+    每条：{id, name, url, pwd, kind, kind_idx, time, e, heart, share_code}
+    e=1 通常是「已失效」标记（站点自己标的，仅供参考，真正的死活由 115 验证）。
+    """
+    if not isinstance(j, dict):
+        return []
+    pl = j.get("panlist") or j.get("pan_list") or {}
+    rows = []
+
+    if isinstance(pl, list):
+        for it in pl:
+            if isinstance(it, dict) and it.get("url"):
+                kind = pan_kind_of(it.get("url"), [it.get("tname")] if it.get("tname") else None, 0)
+                rows.append({
+                    "id": str(it.get("id") or ""), "name": str(it.get("name") or ""),
+                    "url": str(it.get("url") or ""), "pwd": pan_pwd_of(it.get("url"), it.get("p") or ""),
+                    "kind": str(it.get("tname") or kind), "kind_idx": None,
+                    "time": str(it.get("time") or ""), "e": int(it.get("e") or 0),
+                    "heart": int(it.get("heart") or 0),
+                })
+    elif isinstance(pl, dict):
+        urls = pl.get("url") or []
+        if not isinstance(urls, list):
+            return []
+        names = pl.get("name") or []
+        pwds = pl.get("p") or []
+        types = pl.get("type") or []
+        tnames = pl.get("tname") or []
+        times = pl.get("time") or []
+        es = pl.get("e") or []
+        hearts = pl.get("heart") or []
+        ids = pl.get("id") or []
+
+        def at(arr, i, default=""):
+            return arr[i] if isinstance(arr, list) and i < len(arr) else default
+
+        for i, u in enumerate(urls):
+            u = str(u or "").strip()
+            if not u:
+                continue
+            tp = at(types, i, None)
+            rows.append({
+                "id": str(at(ids, i, "")),
+                "name": str(at(names, i, "")),
+                "url": u,
+                "pwd": pan_pwd_of(u, at(pwds, i, "")),
+                "kind": pan_kind_of(u, tnames if isinstance(tnames, list) else None, tp),
+                "kind_idx": tp,
+                "time": str(at(times, i, "")),
+                "e": int(at(es, i, 0) or 0),
+                "heart": int(at(hearts, i, 0) or 0),
+            })
+
+    for r in rows:
+        m = _SHARE_CODE.search(r["url"])
+        r["share_code"] = m.group(1) if m else ""
+        r["is_115"] = ("115" in r["kind"]) or bool(m)
+    return rows
+
+
+def _dedup_pans(pans):
+    """同一条链接只留一份（站点会重复挂同一个分享）。"""
+    out, seen = [], set()
+    for p in pans or []:
+        key = (p.get("url") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 def extract_magnets(obj, base, referer=None):
     """从 _obj 里找出磁力及其大小标注"""
     cands = []
@@ -1069,6 +1252,9 @@ def normalize_detail(obj, base):
             "desc": re.sub(r"<[^>]+>", "", str(desc))[:600],
             "tags": tags,
             "meta": " · ".join(extra),
+            # 年份和更新状态：订阅用它们做「同名不同片」和「剧集是否完结」的判断
+            "year": str(d.get("year") or "").strip(),
+            "stat": re.sub(r"<[^>]+>", "", str(d.get("status") or "")).strip()[:40],
             "down_urls": [],
         }
 

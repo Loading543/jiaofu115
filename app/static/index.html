@@ -21,13 +21,14 @@
   </div>
 
   <nav class="nav">
-    <a href="#latest" data-nav="latest"><span>🎬</span><b>最新更新</b></a>
-    <a href="#search" data-nav="search"><span>🔍</span><b>搜索</b></a>
-    <a href="#wash" data-nav="wash"><span>🔄</span><b>洗版升级</b></a>
-    <a href="#tasks" data-nav="tasks"><span>📥</span><b>推送记录</b></a>
-    <a href="#pan115" data-nav="pan115"><span>☁️</span><b>115 账号</b></a>
-    <a href="#site" data-nav="site"><span>🔐</span><b>站点登录</b></a>
-    <a href="#settings" data-nav="settings"><span>⚙️</span><b>设置</b></a>
+    <a href="#latest" data-nav="latest"><span>🎬</span><b>最新更新</b><em class="nshort">最新</em></a>
+    <a href="#search" data-nav="search"><span>🔍</span><b>搜索</b><em class="nshort">搜索</em></a>
+    <a href="#subs" data-nav="subs"><span>⭐</span><b>订阅追片</b><em class="nshort">订阅</em></a>
+    <a href="#wash" data-nav="wash"><span>🔄</span><b>洗版升级</b><em class="nshort">洗版</em></a>
+    <a href="#tasks" data-nav="tasks"><span>📥</span><b>推送记录</b><em class="nshort">记录</em></a>
+    <a href="#pan115" data-nav="pan115"><span>☁️</span><b>115 账号</b><em class="nshort">账号</em></a>
+    <a href="#site" data-nav="site"><span>🔐</span><b>站点登录</b><em class="nshort">登录</em></a>
+    <a href="#settings" data-nav="settings"><span>⚙️</span><b>设置</b><em class="nshort">设置</em></a>
   </nav>
 
   <div class="side-status">
@@ -46,11 +47,13 @@
     </div>
     <div class="topbar-right">
       <div class="stat"><b id="st-items">0</b><span>条目</span></div>
-      <div class="stat"><b id="st-fresh">0</b><span>新上架</span></div>
+      <div class="stat" title="评分达到门槛、还没推的新条目"><b id="st-fresh">0</b><span>新上架</span></div>
       <button class="btn ghost" id="btn-pause">暂停推送</button>
       <button class="btn ghost" id="btn-sync">立即同步</button>
     </div>
   </header>
+
+  <div class="conv-banner hidden" id="conv-banner"></div>
 
   <section class="view" id="view-latest">
     <div class="filterbar">
@@ -61,7 +64,7 @@
       <span id="latest-count" class="muted">—</span>
       <span class="sp"></span>
       <select id="sort-select" class="mini-select" title="排序方式">
-        <option value="new">最新上架</option>
+        <option value="new">按网站顺序</option>
         <option value="old">最早上架</option>
         <option value="size">体积从大到小</option>
         <option value="douban">豆瓣评分从高到低</option>
@@ -80,8 +83,118 @@
       <input id="q" type="search" placeholder="搜索电影 / 电视剧 / 动漫，回车开始搜索">
       <button class="btn" id="btn-search">搜索</button>
     </div>
-    <div class="hint">搜索结果点「秒传 115」，会按你的规则挑磁力（默认体积最大）推送到已选目录。</div>
+    <div class="hint">搜索结果点「秒传 115」，会按你的规则挑磁力（默认体积最大）推送到已选目录。
+      想长期追一部片就点卡片上的「订阅」——现在没片源也没关系，出了会自动推，出更高画质会自动洗版。</div>
     <div class="grid" id="grid-search"></div>
+  </section>
+
+  <section class="view hidden" id="view-subs">
+    <div class="card org-hero sub-hero">
+      <div class="org-toprow">
+        <div>
+          <h2>订阅追片</h2>
+          <p class="muted">填个片名就行：系统定期去站点搜，有磁力就自动离线到 115；以后出现更高画质（比如 4K 出了）会自动洗版替换。
+            <b>电视剧 / 动漫选「追更」</b>，每更新一集就自动下一集，不用等完结；站点暂时没种也会一直盯着。
+            <b>磁力全是死种没速度时，自动改用站点的 115 网盘分享转存</b>（服务端复制，不占下载带宽）。</p>
+        </div>
+        <div class="sub-auto">
+          <label class="switch" title="自动检查总开关">
+            <input type="checkbox" id="sub-enabled"><span></span>
+          </label>
+          <span class="muted">每 <input id="sub-interval" class="mini-num" type="number" min="10" max="1440"> 分钟检查</span>
+          <button class="btn ghost small" id="btn-sub-savecfg">保存</button>
+        </div>
+      </div>
+      <div class="sub-panopts">
+        <label class="pick"><input type="checkbox" id="sub-panfallback">
+          磁力死种没速度时改用 115 网盘分享转存</label>
+        <label class="pick"><input type="checkbox" id="sub-panpack">
+          追更找不到单集文件时允许整包转存</label>
+        <span class="muted small">115 转存是服务端复制，秒级完成；死链会自动拉黑</span>
+      </div>
+      <div class="kpis" id="sub-kpis"></div>
+    </div>
+
+    <div class="card">
+      <div class="cardhead">
+        <h2>添加订阅</h2>
+        <span class="sp"></span>
+        <span class="muted small">下面的规则只影响「从这里添加」的订阅</span>
+      </div>
+      <div class="form-grid cols3">
+        <div class="field"><label>片名 / 关键词</label>
+          <input id="sub-kw" placeholder="例如：沙丘 2" autocomplete="off"></div>
+        <div class="field"><label>类型</label>
+          <select id="sub-cat">
+            <option value="">不限</option>
+            <option value="mv">电影</option>
+            <option value="tv">电视剧</option>
+            <option value="ac">动漫</option>
+          </select>
+        </div>
+        <div class="field"><label>年份（可选，防同名老片）</label>
+          <input id="sub-year" inputmode="numeric" placeholder="2024" autocomplete="off"></div>
+        <div class="field"><label>最低画质</label>
+          <select id="sub-qmin">
+            <option value="">不限（有就推）</option>
+            <option value="1080p">至少 1080p</option>
+            <option value="2160p">只接受 4K（等 4K 出）</option>
+          </select>
+        </div>
+        <div class="field"><label>体积范围（GB，0=不限）</label>
+          <div class="range2">
+            <input id="sub-mingb" type="number" min="0" step="0.1" placeholder="最小">
+            <span class="muted">–</span>
+            <input id="sub-maxgb" type="number" min="0" step="0.1" placeholder="最大">
+          </div>
+        </div>
+        <div class="field"><label>剧集更新方式（电影忽略）</label>
+          <select id="sub-epmode">
+            <option value="">等完结再推</option>
+            <option value="follow">追更（每集自动下）</option>
+            <option value="all">有就推（不等完结）</option>
+          </select>
+        </div>
+        <div class="field" id="f-epfrom"><label>追更起始集（0 = 只追新）</label>
+          <input id="sub-epfrom" type="number" min="0" placeholder="0" autocomplete="off">
+        </div>
+        <div class="field"><label>洗版</label>
+          <label class="pick"><input type="checkbox" id="sub-wash" checked> 出现更高画质时自动洗版</label>
+          <label class="pick"><input type="checkbox" id="sub-washfull"> 剧集只接受整包洗版</label>
+        </div>
+        <div class="field"><label>包含词（可选，| 分隔）</label>
+          <input id="sub-inc" placeholder="HDR|杜比|60fps" autocomplete="off"></div>
+        <div class="field"><label>排除词（可选，| 分隔）</label>
+          <input id="sub-exc" placeholder="CAM|枪版|预告" autocomplete="off"></div>
+        <div class="field"><label>单独检查间隔（小时，0=跟随全局）</label>
+          <input id="sub-iv" type="number" min="0" placeholder="0" autocomplete="off"></div>
+      </div>
+      <div class="sub-addbar">
+        <button class="btn" id="btn-sub-add">添加订阅</button>
+        <button class="btn ghost" id="btn-sub-find">先搜候选看看</button>
+        <span class="muted small" id="sub-form-msg"></span>
+      </div>
+      <div class="sub-cand" id="sub-cand"></div>
+    </div>
+
+    <div class="card">
+      <div class="cardhead">
+        <h2>我的订阅 <span class="muted small" id="sub-count"></span></h2>
+        <span class="sp"></span>
+        <span class="muted small" id="sub-run-msg"></span>
+        <button class="btn ghost small" id="btn-sub-all">全部检查一次</button>
+      </div>
+      <div class="sub-list" id="sub-list"><div class="empty">还没有订阅</div></div>
+    </div>
+
+    <div class="card">
+      <div class="cardhead">
+        <h2>订阅日志</h2>
+        <span class="sp"></span>
+        <button class="btn ghost small" id="btn-sub-logclear">清空日志</button>
+      </div>
+      <div class="sublog" id="sub-log"><div class="empty">暂无记录</div></div>
+    </div>
   </section>
 
   <section class="view hidden" id="view-wash">
@@ -191,18 +304,62 @@
         </div>
         <div class="field"><label>最小体积（GB，0=不限）</label><input id="auto-min" type="number" min="0" step="0.1"></div>
         <div class="field"><label>最大体积（GB，0=不限）</label><input id="auto-max" type="number" min="0" step="0.1"></div>
+        <div class="field"><label>评分门槛（低于它不推）</label>
+          <select id="auto-minscore" title="豆瓣分优先；没有豆瓣分时用 IMDB 分。只影响自动推送，订阅和手动推不受限制">
+            <option value="0">不限（什么分都推）</option>
+            <option value="5">≥ 5.0 分</option>
+            <option value="5.5">≥ 5.5 分</option>
+            <option value="6">≥ 6.0 分</option>
+            <option value="6.5">≥ 6.5 分</option>
+            <option value="7">≥ 7.0 分</option>
+            <option value="7.5">≥ 7.5 分</option>
+            <option value="8">≥ 8.0 分</option>
+            <option value="8.5">≥ 8.5 分</option>
+            <option value="9">≥ 9.0 分</option>
+          </select>
+        </div>
         <div class="field"><label>单轮最多推送</label><input id="auto-maxpush" type="number" min="1"></div>
+        <div class="field"><label>每天最多推送（0=不限）</label><input id="auto-maxday" type="number" min="0"></div>
+        <div class="field"><label>115 空间保护（GB，0=不检查）</label><input id="auto-minfree" type="number" min="0" title="同时看离线下载配额和网盘空间，哪个先见底就停推"></div>
         <div class="field"><label>增量同步每栏目页数</label><input id="auto-pages" type="number" min="1"></div>
       </div>
+      <label class="cat-line" style="margin-top:12px">
+        <span class="switch"><input type="checkbox" id="auto-4k"><span></span></span>
+        <div><div class="nm">优先 4K</div>
+          <div class="slug">磁力里只要有一条 2160p/4K，就推它，哪怕别的 1080p 体积更大、能秒传。
+            没有 4K 才退到 1080p，不会因为开了这个就不推。</div></div>
+      </label>
+      <label class="cat-line" style="margin-top:12px">
+        <span class="switch"><input type="checkbox" id="auto-sec"><span></span></span>
+        <div><div class="nm">优先秒传</div>
+          <div class="slug">同一画质档位里，先挑 115 能直接秒传的（已秒传过的 / 115 任务里已完成的）。
+            画质优先于秒传，不会为了秒传把 4K 降成 1080p。</div></div>
+      </label>
+      <label class="cat-line" style="margin-top:12px">
+        <span class="switch"><input type="checkbox" id="auto-scoreunknown"><span></span></span>
+        <div><div class="nm">没评分的也推</div>
+          <div class="slug">站点上刚上线的新片常常还没有豆瓣/IMDB 分。默认不推，等出分再进队列；
+            勾上则「没分照推」，只挡「有分但低于最低评分」的。</div></div>
+      </label>
       <button class="btn" id="btn-save-settings">保存设置</button>
     </div>
 
     <div class="card">
       <h2>推送保存目录</h2>
-      <p class="muted">选一个 115 网盘里的目录，磁力离线完成后会直接落到这里。</p>
-      <div class="pathrow">
-        <div class="pathbox" id="pan-path-show2">未选择（默认云下载）</div>
-        <button class="btn small" id="btn-pick-dir2">选择目录</button>
+      <p class="muted">按栏目分开存，电影、剧集、动漫各落各的目录，后面自己找片不会混在一起。留空 = 跟随默认目录。</p>
+      <div class="form-grid">
+        <div class="field"><label>默认目录（所有栏目）</label>
+          <div class="pathrow"><div class="pathbox" id="pan-path-show2">未选择（默认云下载）</div>
+            <button class="btn small" data-pickdir="">选择</button></div></div>
+        <div class="field"><label>电影</label>
+          <div class="pathrow"><div class="pathbox" id="pan-path-mv">跟随默认</div>
+            <button class="btn small" data-pickdir="mv">选择</button></div></div>
+        <div class="field"><label>电视剧</label>
+          <div class="pathrow"><div class="pathbox" id="pan-path-tv">跟随默认</div>
+            <button class="btn small" data-pickdir="tv">选择</button></div></div>
+        <div class="field"><label>动漫</label>
+          <div class="pathrow"><div class="pathbox" id="pan-path-ac">跟随默认</div>
+            <button class="btn small" data-pickdir="ac">选择</button></div></div>
       </div>
     </div>
 
